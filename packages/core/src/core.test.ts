@@ -3,6 +3,7 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { afterEach, describe, it } from 'node:test';
+import { HeadlessMnemonExecutor, MNEMON_READONLY_TOOL_NAMES } from '@nuh/dsh-shims';
 import { bootDshHeadlessRuntime } from './dsh-runtime.ts';
 import { AuditLedger } from './ledger.ts';
 
@@ -136,5 +137,49 @@ describe('@nuh/core headless DSH runtime and audit ledger', () => {
     assert.equal(summary[0]?.summary, 'hello ledger');
     assert.equal(summary[1]?.role, 'assistant');
     assert.equal(summary[1]?.summary, '[nuh-echo] hello ledger');
+  });
+
+  it('activates dsh-mnemon headless memory tools and executes read-only queries safely', async () => {
+    const tempDir = mkdtempSync(path.join(tmpdir(), 'nuh-core-mnemon-'));
+    let runtime: Awaited<ReturnType<typeof bootDshHeadlessRuntime>> | undefined;
+    let executor: HeadlessMnemonExecutor | undefined;
+    try {
+      runtime = await bootDshHeadlessRuntime({
+        dshHome: tempDir,
+        cwd: tempDir,
+      });
+
+      for (const toolName of MNEMON_READONLY_TOOL_NAMES) {
+        assert.ok(
+          runtime.ctx.tools.get(toolName),
+          `expected dsh-mnemon tool ${toolName} to be registered in ctx.tools`,
+        );
+      }
+
+      executor = new HeadlessMnemonExecutor(runtime.ctx, tempDir);
+      const listed = executor.listTools().map((item) => item.name);
+      assert.deepEqual(new Set(listed), new Set(MNEMON_READONLY_TOOL_NAMES));
+
+      const bodies = await executor.callTool('mnemon_memory_bodies', {});
+      assert.equal(bodies.isError, false);
+      assert.equal(typeof bodies.structuredContent?.total, 'number');
+
+      const status = await executor.callTool('mnemon_status', {});
+      assert.equal(status.isError, false);
+      assert.equal(status.structuredContent?.healthy, true);
+
+      const docs = await executor.callTool('mnemon_document_search', { query: 'test' });
+      assert.equal(docs.isError, false);
+      assert.equal(docs.structuredContent?.query, 'test');
+
+      await assert.rejects(
+        () => executor?.callTool('mnemon_remember', { content: 'blocked' }) ?? Promise.resolve(),
+        /not allowed/,
+      );
+    } finally {
+      await executor?.dispose();
+      await runtime?.dispose();
+      rmSync(tempDir, { recursive: true, force: true });
+    }
   });
 });

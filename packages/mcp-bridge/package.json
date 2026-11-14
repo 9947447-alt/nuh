@@ -3,6 +3,9 @@
   "version": "0.1.0",
   "private": true,
   "type": "module",
+  "bin": {
+    "nuh-mcp-bridge": "./dist/bin.js"
+  },
   "exports": {
     ".": {
       "types": "./src/index.ts",
@@ -11,7 +14,12 @@
     }
   },
   "scripts": {
-    "build": "tsc",
+    "build": "tsc -p tsconfig.build.json",
     "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "1.32.2",
+    "@nuh/protocol": "workspace:*",
+    "zod": "4.6.7"
   }
 }

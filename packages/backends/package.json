@@ -11,7 +11,11 @@
     }
   },
   "scripts": {
-    "build": "tsc",
+    "build": "tsc -p tsconfig.build.json",
     "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@nuh/protocol": "workspace:*",
+    "zod": "4.6.7"
   }
 }

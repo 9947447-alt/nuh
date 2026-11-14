@@ -146,10 +146,14 @@ export const ThreadListResultSchema = z.object({
 });
 export type ThreadListResult = z.infer<typeof ThreadListResultSchema>;
 
+export const ThoughtLevelSchema = z.enum(['low', 'medium', 'high']);
+export type ThoughtLevel = z.infer<typeof ThoughtLevelSchema>;
+
 export const ThreadSetBackendParamsSchema = z.object({
   threadId: z.string().min(1),
   backend: BackendKindSchema,
   model: z.string().min(1).optional(),
+  thoughtLevel: ThoughtLevelSchema.optional(),
 });
 export type ThreadSetBackendParams = z.infer<typeof ThreadSetBackendParamsSchema>;
 
@@ -157,6 +161,7 @@ export const ThreadSetBackendResultSchema = z.object({
   threadId: z.string().min(1),
   backend: BackendKindSchema,
   model: z.string().min(1).optional(),
+  thoughtLevel: ThoughtLevelSchema.optional(),
 });
 export type ThreadSetBackendResult = z.infer<typeof ThreadSetBackendResultSchema>;
 

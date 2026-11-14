@@ -145,10 +145,27 @@ export const AgyAcpPromptResultSchema = z
       .object({
         inputTokens: z.number().int().nonnegative(),
         outputTokens: z.number().int().nonnegative(),
+        cachedReadTokens: z.number().int().nonnegative().optional(),
+        cachedWriteTokens: z.number().int().nonnegative().optional(),
+        thoughtTokens: z.number().int().nonnegative().optional(),
         totalTokens: z.number().int().nonnegative().optional(),
       })
       .passthrough()
       .optional(),
+  })
+  .passthrough();
+
+export const AgyAcpSetConfigOptionParamsSchema = z
+  .object({
+    sessionId: z.string().min(1),
+    configId: z.string().min(1),
+    value: z.string().min(1),
+  })
+  .passthrough();
+
+export const AgyAcpSetConfigOptionResultSchema = z
+  .object({
+    configOptions: z.array(z.unknown()),
   })
   .passthrough();
 
@@ -239,7 +256,7 @@ export function parseAgyAcpWireMessage(raw: unknown): AgyAcpWireMessage {
  */
 export function buildAgyAcpPermissionResponse(
   id: number | string,
-  optionId: 'allow' | 'deny',
+  optionId: string,
 ): {
   readonly jsonrpc: '2.0';
   readonly id: number | string;
@@ -250,6 +267,11 @@ export function buildAgyAcpPermissionResponse(
   const idParsed = JsonRpcIdSchema.safeParse(id);
   if (!idParsed.success) {
     throw new NuhProtocolError(NUH_ERROR_CODES.INVALID_PARAMS, '无效的 ACP 权限请求 id', { id });
+  }
+  if (optionId.trim().length === 0) {
+    throw new NuhProtocolError(NUH_ERROR_CODES.INVALID_PARAMS, '无效的 ACP 权限选项 optionId', {
+      optionId,
+    });
   }
   return {
     jsonrpc: '2.0',

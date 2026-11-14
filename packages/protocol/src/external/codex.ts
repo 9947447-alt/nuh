@@ -56,6 +56,53 @@ export const CodexTurnStartParamsSchema = z
   .object({
     threadId: z.string().min(1),
     input: z.array(CodexTurnInputItemSchema).min(1),
+    model: z.string().min(1).optional(),
+  })
+  .passthrough();
+
+export const CodexThreadResumeParamsSchema = z
+  .object({
+    threadId: z.string().min(1),
+    cwd: z.string().min(1).optional(),
+    approvalPolicy: z.enum(['untrusted', 'on-failure', 'on-request', 'never']).optional(),
+    sandbox: z.enum(['read-only', 'workspace-write', 'danger-full-access']).optional(),
+  })
+  .passthrough();
+
+export const CodexTurnInterruptParamsSchema = z
+  .object({
+    threadId: z.string().min(1),
+    turnId: z.string().min(1),
+  })
+  .passthrough();
+
+export const CodexInitializeResultSchema = z
+  .object({
+    userAgent: z.string().optional(),
+    codexHome: z.string().optional(),
+    platformFamily: z.string().optional(),
+    platformOs: z.string().optional(),
+  })
+  .passthrough();
+
+export const CodexThreadStartResultSchema = z
+  .object({
+    thread: z
+      .object({
+        id: z.string().min(1),
+      })
+      .passthrough(),
+  })
+  .passthrough();
+
+export const CodexTurnStartResultSchema = z
+  .object({
+    turn: z
+      .object({
+        id: z.string().min(1),
+        status: z.string().optional(),
+      })
+      .passthrough(),
   })
   .passthrough();
 
@@ -301,6 +348,8 @@ export const CodexTokenUsageUpdatedNotificationSchema = z
                 totalTokens: z.number(),
                 inputTokens: z.number(),
                 outputTokens: z.number(),
+                cachedInputTokens: z.number().optional(),
+                reasoningOutputTokens: z.number().optional(),
               })
               .passthrough(),
           })
@@ -427,6 +476,24 @@ export function parseCodexClientRequest(raw: unknown): {
     if (!parsed.success) {
       throw formatZodValidationError(
         'Codex turn/start 参数校验失败',
+        parsed.error,
+        NUH_ERROR_CODES.INVALID_PARAMS,
+      );
+    }
+  } else if (msg.method === 'thread/resume') {
+    const parsed = CodexThreadResumeParamsSchema.safeParse(msg.params);
+    if (!parsed.success) {
+      throw formatZodValidationError(
+        'Codex thread/resume 参数校验失败',
+        parsed.error,
+        NUH_ERROR_CODES.INVALID_PARAMS,
+      );
+    }
+  } else if (msg.method === 'turn/interrupt') {
+    const parsed = CodexTurnInterruptParamsSchema.safeParse(msg.params);
+    if (!parsed.success) {
+      throw formatZodValidationError(
+        'Codex turn/interrupt 参数校验失败',
         parsed.error,
         NUH_ERROR_CODES.INVALID_PARAMS,
       );

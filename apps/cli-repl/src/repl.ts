@@ -4,6 +4,10 @@ import path from 'node:path';
 import { createInterface } from 'node:readline';
 import type { Readable, Writable } from 'node:stream';
 import {
+  type ApprovalDecision,
+  type BackendKind,
+  BackendKindSchema,
+  type BackendStatus,
   classifyJsonRpcMessage,
   InitializeResultSchema,
   type JsonRpcId,
@@ -14,7 +18,10 @@ import {
   parseNuhNotification,
   parseNuhServerRequest,
   serializeNdjsonLine,
+  type ThoughtLevel,
+  ThoughtLevelSchema,
   ThreadListResultSchema,
+  ThreadSetBackendResultSchema,
   ThreadStartResultSchema,
   TurnInterruptResultSchema,
   TurnStartResultSchema,
@@ -25,6 +32,8 @@ export interface ReplOptions {
   readonly daemonArgs?: readonly string[];
   readonly daemonEnv?: NodeJS.ProcessEnv;
   readonly workdir?: string;
+  readonly defaultBackend?: BackendKind;
+  readonly defaultModel?: string;
   readonly input?: Readable;
   readonly output?: Writable;
   readonly errorOutput?: Writable;
@@ -34,6 +43,11 @@ export interface ReplOptions {
 interface PendingRpc {
   readonly resolve: (value: unknown) => void;
   readonly reject: (reason: Error) => void;
+}
+
+interface PendingApprovalPrompt {
+  readonly id: JsonRpcId;
+  readonly resolve: (decision: ApprovalDecision) => void;
 }
 
 export function resolveDefaultDaemonEntry(): string {
@@ -56,6 +70,34 @@ export function resolveDefaultDaemonEntry(): string {
   throw new Error(
     `无法定位 NUH Daemon 入口文件，请先运行 pnpm build 或通过 --daemon / NUH_DAEMON_ENTRY 指定路径`,
   );
+}
+
+function parseApprovalChoice(input: string): ApprovalDecision | null {
+  const normalized = input.trim().toLowerCase();
+  if (
+    normalized === 'y' ||
+    normalized === 'yes' ||
+    normalized === 'allow' ||
+    normalized === 'allow_once'
+  ) {
+    return 'allow_once';
+  }
+  if (normalized === 'a' || normalized === 'always' || normalized === 'allow_for_session') {
+    return 'allow_for_session';
+  }
+  if (normalized === 'n' || normalized === 'no' || normalized === 'deny') {
+    return 'deny';
+  }
+  return null;
+}
+
+function formatBackendList(backends: readonly BackendStatus[]): string {
+  return backends
+    .map(
+      (b) =>
+        `  - ${b.kind}: available=${String(b.available)} authenticated=${String(b.authenticated)}${b.reason ? ` (${b.reason})` : ''}`,
+    )
+    .join('\n');
 }
 
 /**
@@ -87,8 +129,13 @@ export async function startRepl(options: ReplOptions = {}): Promise<number> {
   const daemonStderr = child.stderr;
 
   const pending = new Map<JsonRpcId, PendingRpc>();
+  const pendingApprovalQueue: PendingApprovalPrompt[] = [];
   let nextRequestId = 1;
   let currentThreadId: string | null = null;
+  let currentBackend: BackendKind = options.defaultBackend ?? 'native-dsh';
+  let currentModel: string | undefined = options.defaultModel;
+  let currentThoughtLevel: ThoughtLevel | undefined;
+  let knownBackends: BackendStatus[] = [];
   let activeTurnId: string | null = null;
   const completedTurnIds = new Set<string>();
   const turnWaiters = new Map<string, () => void>();
@@ -108,6 +155,10 @@ export async function startRepl(options: ReplOptions = {}): Promise<number> {
             `Daemon 在请求 ${String(id)} 完成前退出 (code=${String(code)}, signal=${String(signal)})`,
           ),
         );
+      }
+      while (pendingApprovalQueue.length > 0) {
+        const approval = pendingApprovalQueue.shift();
+        approval?.resolve('deny');
       }
       for (const [turnId, wake] of turnWaiters.entries()) {
         completedTurnIds.add(turnId);
@@ -147,6 +198,22 @@ export async function startRepl(options: ReplOptions = {}): Promise<number> {
         jsonrpc: '2.0',
         method,
         ...(params !== undefined ? { params } : {}),
+      }),
+    );
+  };
+
+  const sendApprovalResponse = (id: JsonRpcId, decision: ApprovalDecision, note?: string): void => {
+    if (daemonStdin.writableEnded || daemonStdin.destroyed) {
+      return;
+    }
+    daemonStdin.write(
+      serializeNdjsonLine({
+        jsonrpc: '2.0',
+        id,
+        result: {
+          decision,
+          ...(note !== undefined ? { note } : {}),
+        },
       }),
     );
   };
@@ -193,13 +260,19 @@ export async function startRepl(options: ReplOptions = {}): Promise<number> {
             output.write(`[item ${notif.params.itemId} started (${notif.params.kind})]\n`);
             break;
           case 'item/delta':
-            output.write(notif.params.delta);
+            if (notif.params.channel === 'thinking') {
+              output.write(`[thinking] ${notif.params.delta}`);
+            } else {
+              output.write(notif.params.delta);
+            }
             break;
           case 'item/completed':
             output.write(`\n[item ${notif.params.itemId} ${notif.params.status}]\n`);
             break;
           case 'turn/completed':
-            output.write(`[turn ${notif.params.turnId} ${notif.params.status}]\n`);
+            output.write(
+              `[turn ${notif.params.turnId} ${notif.params.status}${notif.params.error ? `: ${notif.params.error.message}` : ''}]\n`,
+            );
             completedTurnIds.add(notif.params.turnId);
             if (activeTurnId === notif.params.turnId) {
               activeTurnId = null;
@@ -217,13 +290,15 @@ export async function startRepl(options: ReplOptions = {}): Promise<number> {
       }
       if (frame.kind === 'request') {
         const srvReq = parseNuhServerRequest(raw);
-        daemonStdin.write(
-          serializeNdjsonLine({
-            jsonrpc: '2.0',
-            id: srvReq.id,
-            result: { decision: 'deny', note: 'cli-repl interactive approval not enabled' },
-          }),
+        const commandLine = srvReq.params.command ? `\n  command: ${srvReq.params.command}` : '';
+        output.write(
+          `\n[approval required] (${srvReq.params.backend}/${srvReq.params.category}) ${srvReq.params.title}${commandLine}\nApprove? [y=allow_once / a=allow_for_session / n=deny]: `,
         );
+        void new Promise<ApprovalDecision>((resolve) => {
+          pendingApprovalQueue.push({ id: srvReq.id, resolve });
+        }).then((decision) => {
+          sendApprovalResponse(srvReq.id, decision);
+        });
       }
     } catch (cause) {
       const detail = cause instanceof Error ? cause.message : String(cause);
@@ -252,11 +327,13 @@ export async function startRepl(options: ReplOptions = {}): Promise<number> {
     protocolVersion: NUH_PROTOCOL_VERSION,
   });
   const initRes = InitializeResultSchema.parse(initRaw);
+  knownBackends = initRes.backends;
   sendNotification('initialized');
 
   const threadRaw = await sendRequest('thread/start', {
     workdir,
-    defaultBackend: 'native-dsh',
+    defaultBackend: currentBackend,
+    ...(currentModel !== undefined ? { model: currentModel } : {}),
   });
   const threadRes = ThreadStartResultSchema.parse(threadRaw);
   currentThreadId = threadRes.threadId;
@@ -264,7 +341,7 @@ export async function startRepl(options: ReplOptions = {}): Promise<number> {
   output.write(
     `[connected] ${initRes.serverInfo.name} v${initRes.serverInfo.version} (plugins=${String(initRes.loadedDshPlugins.length)})\n`,
   );
-  output.write(`[thread ${currentThreadId} ready]\n`);
+  output.write(`[thread ${currentThreadId} ready (backend=${currentBackend})]\n`);
 
   const userRl = createInterface({
     input,
@@ -289,11 +366,19 @@ export async function startRepl(options: ReplOptions = {}): Promise<number> {
   let closing = false;
   let lineQueue = Promise.resolve();
 
+  const flushPendingApprovalsAsDeny = (): void => {
+    while (pendingApprovalQueue.length > 0) {
+      const approval = pendingApprovalQueue.shift();
+      approval?.resolve('deny');
+    }
+  };
+
   const finishAndClose = async (): Promise<void> => {
     if (closing) {
       return;
     }
     closing = true;
+    flushPendingApprovalsAsDeny();
     await waitForActiveTurn();
     if (!daemonStdin.writableEnded && !daemonStdin.destroyed) {
       daemonStdin.end();
@@ -307,19 +392,38 @@ export async function startRepl(options: ReplOptions = {}): Promise<number> {
     userRl.on('line', (rawLine) => {
       const trimmed = rawLine.trim();
       if (trimmed === '/interrupt') {
+        flushPendingApprovalsAsDeny();
         void (async () => {
-          if (!currentThreadId || !activeTurnId) {
-            output.write('[no active turn]\n');
-          } else {
-            const intRaw = await sendRequest('turn/interrupt', {
-              threadId: currentThreadId,
-              turnId: activeTurnId,
-            });
-            const intRes = TurnInterruptResultSchema.parse(intRaw);
-            output.write(`[interrupt ${String(intRes.interrupted)}]\n`);
+          try {
+            if (!currentThreadId || !activeTurnId) {
+              output.write('[no active turn]\n');
+            } else {
+              const intRaw = await sendRequest('turn/interrupt', {
+                threadId: currentThreadId,
+                turnId: activeTurnId,
+              });
+              const intRes = TurnInterruptResultSchema.parse(intRaw);
+              output.write(`[interrupt ${String(intRes.interrupted)}]\n`);
+            }
+          } catch (cause) {
+            const detail = cause instanceof Error ? cause.message : String(cause);
+            errorOutput.write(`[repl:error] ${detail}\n`);
           }
           showPrompt();
         })();
+        return;
+      }
+
+      if (pendingApprovalQueue.length > 0) {
+        const decision = parseApprovalChoice(trimmed);
+        if (decision !== null) {
+          const approval = pendingApprovalQueue.shift();
+          approval?.resolve(decision);
+        } else {
+          output.write(
+            'Invalid choice. Enter y (allow_once), a (allow_for_session), or n (deny): ',
+          );
+        }
         return;
       }
 
@@ -331,41 +435,152 @@ export async function startRepl(options: ReplOptions = {}): Promise<number> {
           showPrompt();
           return;
         }
-        if (trimmed === '/quit' || trimmed === '/exit') {
-          await finishAndClose();
-          return;
+        try {
+          if (trimmed === '/quit' || trimmed === '/exit') {
+            await finishAndClose();
+            return;
+          }
+          if (trimmed === '/help') {
+            output.write(
+              'Commands: /backends, /backend <kind> [model] [low|medium|high], /model <model> [low|medium|high], /interrupt, /thread, /threads, /quit\n',
+            );
+            showPrompt();
+            return;
+          }
+          if (trimmed === '/backends') {
+            output.write(`[backends]\n${formatBackendList(knownBackends)}\n`);
+            showPrompt();
+            return;
+          }
+          if (trimmed === '/backend') {
+            output.write(
+              `[backend ${currentBackend}${currentModel ? ` model=${currentModel}` : ''}${currentThoughtLevel ? ` thought=${currentThoughtLevel}` : ''}]\n`,
+            );
+            showPrompt();
+            return;
+          }
+          if (trimmed.startsWith('/backend ')) {
+            if (!currentThreadId) {
+              errorOutput.write('[repl:error] 未初始化 threadId\n');
+              showPrompt();
+              return;
+            }
+            const parts = trimmed.slice('/backend '.length).trim().split(/\s+/);
+            const backendParsed = BackendKindSchema.safeParse(parts[0]);
+            if (!backendParsed.success) {
+              errorOutput.write(
+                `[repl:error] 不支持的后端 "${parts[0] ?? ''}"，可选: native-dsh | codex | agy | claude\n`,
+              );
+              showPrompt();
+              return;
+            }
+            const modelArg = parts[1];
+            const thoughtArg = parts[2];
+            let thoughtParsed: ThoughtLevel | undefined;
+            if (thoughtArg !== undefined) {
+              const checked = ThoughtLevelSchema.safeParse(thoughtArg);
+              if (!checked.success) {
+                errorOutput.write(
+                  `[repl:error] 无效 thoughtLevel "${thoughtArg}"，可选: low | medium | high\n`,
+                );
+                showPrompt();
+                return;
+              }
+              thoughtParsed = checked.data;
+            }
+            const resRaw = await sendRequest('thread/setBackend', {
+              threadId: currentThreadId,
+              backend: backendParsed.data,
+              ...(modelArg !== undefined ? { model: modelArg } : {}),
+              ...(thoughtParsed !== undefined ? { thoughtLevel: thoughtParsed } : {}),
+            });
+            const res = ThreadSetBackendResultSchema.parse(resRaw);
+            currentBackend = res.backend;
+            currentModel = res.model;
+            currentThoughtLevel = res.thoughtLevel;
+            output.write(
+              `[backend switched -> ${currentBackend}${currentModel ? ` model=${currentModel}` : ''}${currentThoughtLevel ? ` thought=${currentThoughtLevel}` : ''}]\n`,
+            );
+            showPrompt();
+            return;
+          }
+          if (trimmed.startsWith('/model ')) {
+            if (!currentThreadId) {
+              errorOutput.write('[repl:error] 未初始化 threadId\n');
+              showPrompt();
+              return;
+            }
+            const parts = trimmed.slice('/model '.length).trim().split(/\s+/);
+            const modelArg = parts[0];
+            if (!modelArg) {
+              errorOutput.write('[repl:error] 用法: /model <model> [low|medium|high]\n');
+              showPrompt();
+              return;
+            }
+            const thoughtArg = parts[1];
+            let thoughtParsed: ThoughtLevel | undefined;
+            if (thoughtArg !== undefined) {
+              const checked = ThoughtLevelSchema.safeParse(thoughtArg);
+              if (!checked.success) {
+                errorOutput.write(
+                  `[repl:error] 无效 thoughtLevel "${thoughtArg}"，可选: low | medium | high\n`,
+                );
+                showPrompt();
+                return;
+              }
+              thoughtParsed = checked.data;
+            }
+            const resRaw = await sendRequest('thread/setBackend', {
+              threadId: currentThreadId,
+              backend: currentBackend,
+              model: modelArg,
+              ...(thoughtParsed !== undefined ? { thoughtLevel: thoughtParsed } : {}),
+            });
+            const res = ThreadSetBackendResultSchema.parse(resRaw);
+            currentModel = res.model;
+            currentThoughtLevel = res.thoughtLevel;
+            output.write(
+              `[model updated -> ${currentBackend}${currentModel ? ` model=${currentModel}` : ''}${currentThoughtLevel ? ` thought=${currentThoughtLevel}` : ''}]\n`,
+            );
+            showPrompt();
+            return;
+          }
+          if (trimmed === '/thread') {
+            output.write(`[thread ${currentThreadId ?? '(none)'}]\n`);
+            showPrompt();
+            return;
+          }
+          if (trimmed === '/threads') {
+            const listRaw = await sendRequest('thread/list', {});
+            const listRes = ThreadListResultSchema.parse(listRaw);
+            output.write(`${JSON.stringify(listRes.threads)}\n`);
+            showPrompt();
+            return;
+          }
+          if (!currentThreadId) {
+            errorOutput.write('[repl:error] 未初始化 threadId\n');
+            showPrompt();
+            return;
+          }
+          const turnRaw = await sendRequest('turn/start', {
+            threadId: currentThreadId,
+            input: trimmed,
+          });
+          const turnRes = TurnStartResultSchema.parse(turnRaw);
+          if (!completedTurnIds.has(turnRes.turnId)) {
+            activeTurnId = turnRes.turnId;
+          }
+          await waitForTurn(turnRes.turnId);
+        } catch (cause) {
+          const detail = cause instanceof Error ? cause.message : String(cause);
+          errorOutput.write(`[repl:error] ${detail}\n`);
         }
-        if (trimmed === '/thread') {
-          output.write(`[thread ${currentThreadId ?? '(none)'}]\n`);
-          showPrompt();
-          return;
-        }
-        if (trimmed === '/threads') {
-          const listRaw = await sendRequest('thread/list', {});
-          const listRes = ThreadListResultSchema.parse(listRaw);
-          output.write(`${JSON.stringify(listRes.threads)}\n`);
-          showPrompt();
-          return;
-        }
-        if (!currentThreadId) {
-          errorOutput.write('[repl:error] 未初始化 threadId\n');
-          showPrompt();
-          return;
-        }
-        const turnRaw = await sendRequest('turn/start', {
-          threadId: currentThreadId,
-          input: trimmed,
-        });
-        const turnRes = TurnStartResultSchema.parse(turnRaw);
-        if (!completedTurnIds.has(turnRes.turnId)) {
-          activeTurnId = turnRes.turnId;
-        }
-        await waitForTurn(turnRes.turnId);
         showPrompt();
       });
     });
 
     userRl.on('close', () => {
+      flushPendingApprovalsAsDeny();
       void (async () => {
         await lineQueue;
         await finishAndClose();
