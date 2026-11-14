@@ -3,14 +3,24 @@
   "version": "0.1.0",
   "private": true,
   "type": "module",
+  "packageManager": "pnpm@11.25.0",
   "engines": {
     "node": ">=26.4.0",
     "pnpm": ">=11.9.0"
   },
   "scripts": {
-    "typecheck": "pnpm -r typecheck"
+    "lint": "biome check . && node scripts/check-boundaries.ts",
+    "lint:fix": "biome check --write .",
+    "typecheck": "pnpm -r typecheck && tsc -p tests/tsconfig.json --noEmit && tsc -p scripts/tsconfig.json --noEmit",
+    "test:contract": "node --conditions=development --test tests/contract/*.test.ts",
+    "test:fast": "node scripts/run-tests.ts fast",
+    "build": "pnpm -r build",
+    "test:integration": "node scripts/run-tests.ts integration"
   },
   "devDependencies": {
+    "@biomejs/biome": "2.6.7",
+    "@nuh/protocol": "workspace:*",
+    "@types/node": "26.6.6",
     "typescript": "7.0.2"
   }
 }

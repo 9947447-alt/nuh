@@ -4,6 +4,7 @@
 > - 前置评估报告：[report.md](../report.md)
 > - 系统架构设计：[ARCHITECTURE.md](./ARCHITECTURE.md)
 > - 统一协议规范：[PROTOCOL-v0.1.md](./PROTOCOL-v0.1.md)
+> - 架构决策记录：[adr/README.md](./adr/README.md)
 > - Phase 0 实操清单：[PHASE0-CHECKLIST.md](./PHASE0-CHECKLIST.md)
 
 ---
@@ -13,165 +14,128 @@
 | 维度 | 约束 / 目标 | 架构响应 |
 | :--- | :--- | :--- |
 | **人力与时间** | 单人开发、时间有限 | **不造已有轮子**：直接复用 DSH/Cordis 运行时、Codex CLI 二进制能力、Claude/AGY CLI 接口 |
-| **插件兼容性** | `dsh-plugin` 必须直接可用 | **不魔改 DSH 核心私有 API**：NUH 自身业务逻辑全部以标准 Cordis 插件或极薄 Patch 挂载在 `@deepseek-ai/dsh-base` 上 |
-| **多通道接入** | 主流 API + OpenAI 订阅 + `claude`/`agy` CLI | 定义统一 **`AgentBackend` 插件契约**，通过 `codex app-server` 使用订阅额度，通过 `stream-json` / `acp` 桥接 `claude` 与 `agy` |
-| **前端后置** | 前端设计放到后面 | **Protocol-First**：Phase 1 即锁定 `NUH JSON-RPC 2.0` 守护协议，前期仅交付极简无状态/REPL CLI 用于自测 |
-| **长期演进** | 保留后续切入自研引擎（方案 B）的可能 | 通过协议边界实现 **Strangler Fig（绞杀者模式）**，未来可用 Rust 核心替换调度层并将 DSH 降级为 Plugin Host Sidecar |
+| **插件兼容性** | `dsh-plugin` 必须直接可用 | **不魔改 DSH 核心私有 API**：NUH 自身业务逻辑全部以标准 Cordis 插件挂载在 `@deepseek-ai/dsh-base` 上，无头兼容补丁沉淀在 `@nuh/dsh-shims` |
+| **多通道接入** | 主流 API + OpenAI 订阅 + `claude`/`agy` CLI | 定义统一 **`AgentBackend` 契约**（`@nuh/backends`），通过 `codex app-server --stdio` 使用订阅额度，通过双向 `stream-json` 桥接 `claude`，通过单轨 `agy acp --stdio` 桥接 `agy`（**已否决 `agy -p stream-json` 降级路径**） |
+| **前端后置** | 前端设计放到后面 | **Protocol-First**：Phase 1 即在 `@nuh/protocol` 锁定 `NUH JSON-RPC 2.0` 守护协议，Phase 3 验收前冻结一切 TUI/Web/Desktop 框架引入，仅保留极简 `apps/cli-repl` 用于纯 stdio 自测 |
+| **长期演进** | 保留后续切入自研引擎（方案 B）的可能 | 通过 `@nuh/protocol` 边界实现 **Strangler Fig（绞杀者模式）**，未来可用独立引擎替换调度层并将 DSH 降级为 Plugin Host Sidecar |
 
 ---
 
-## 2. 本机环境基线（实测与待补齐项）
+## 2. 本机环境基线（Phase 0 实测对齐）
 
-以下为当前开发环境实测结果：
-
-- **已就绪**：
-  - `node`: `v26.4.0`（`/opt/homebrew/bin/node`，满足 `@deepseek-ai/dsh` 对现代 Node `^22.19` / `>=24` 的要求）
-  - `pnpm`: `11.9.0`（`/opt/homebrew/bin/pnpm`）
-  - `codex`: `codex-cli 0.167.0`（`/opt/homebrew/bin/codex`），已确认具备：
-    - `codex app-server`（支持 `stdio://`、`unix://`、`ws://`，以及 `generate-ts` / `generate-json-schema`）
-    - `codex sandbox`（支持 `--sandbox-state-json`、`--sandbox-state-disable-network`、`--log-denials`）
-    - `codex exec`（支持 `--json`、`resume`、`--worktree`）、`codex exec-server`、`codex mcp`、`codex plugin`
-- **待 Phase 0 首步核实/补齐**（当前默认 `PATH` 与 `~/.local/bin` 未检出）：
-  - `@deepseek-ai/dsh`（通过 `pnpm dlx` / 全局安装或本地工作区依赖引入）
-  - `claude` CLI（确认实际安装路径、登录态及 `--input-format stream-json` 可用性）
-  - `agy` CLI（确认实际安装路径、登录态及 `agy acp` / `agy -p --output-format stream-json` 可用性）
+| 组件 | 实测基线 / 路径 | 状态与备注 |
+| :--- | :--- | :--- |
+| **Node.js** | `v26.4.0`（引擎基线 `>=26.4.0`） | 就绪；支持 ESM 与原生 TypeScript 类型剥离 |
+| **pnpm** | `11.25.0`（引擎基线 `>=11.9.0`） | 就绪；根目录 `pnpm-workspace.yaml` 已显式声明 5 个 DSH `allowBuilds` 白名单 |
+| **TypeScript** | `7.0.2`（`strict: true`） | 就绪；禁用 `any` 与隐式类型断言 |
+| **DSH 基座** | `@deepseek-ai/dsh-base@0.2.2-rc.1` + `@deepseek-ai/dsh-app-boot@0.2.2-rc.1` + `@deepseek-ai/cordis@4.1.0` | 必须锁定精确版本号，禁止 `^` / `~`；通过自组装 Profile 无头启动 |
+| **Codex CLI** | `codex-cli 0.167.0`（`/opt/homebrew/bin/codex`） | 已走通 ChatGPT Plus 订阅态 `codex app-server --stdio` 与审批回调；`codex sandbox` 留待 Phase 3 前补测 |
+| **AGY CLI** | `agy 1.5.9`（`/Users/a0000/.local/bin/agy`） | 已走通 `agy acp --stdio`（双向审批 + `session/resume` + 热切换配置）；`-p stream-json` 已确认权限旁路并否决 |
+| **Claude CLI** | `claude 2.1.218`（`/Users/a0000/.local/bin/claude`） | 本机 `loggedIn: false`，已验证 `--mcp-config` 进程拉起，模型端到端留接口待登录态补测 |
 
 ---
 
-## 3. 目标 Monorepo 仓库拓扑（Phase 1 启建）
+## 3. 实际 Monorepo 仓库拓扑（Phase 1 落地结构）
 
 ```text
 nuh/
-├── package.json                 # pnpm workspace 根配置 (Node >= 22.19)
-├── pnpm-workspace.yaml
-├── profiles/
-│   ├── default/
-│   │   └── cordis.patch.yml     # NUH 默认 Cordis 装配清单（基于 dsh-base + NUH 插件）
-│   └── headless/
-│       └── cordis.patch.yml     # 无头/守护进程专用装配
+├── package.json                 # pnpm workspace 根配置 (Node >= 26.4.0, pnpm >= 11.9.0)
+├── pnpm-workspace.yaml          # 工作区范围 + Spike 02 实测的 5 个 DSH allowBuilds 白名单
+├── tsconfig.base.json           # strict TypeScript 7 基线配置
+├── biome.json                   # 统一格式化、严格 Lint 与跨层导入限制
+├── .github/workflows/ci.yml     # Lint -> Typecheck -> Unit & Contract -> Build -> Fake Integration
+├── docs/
+│   ├── PLAN.md
+│   ├── ARCHITECTURE.md
+│   ├── PROTOCOL-v0.1.md
+│   ├── PHASE0-CHECKLIST.md
+│   └── adr/                     # Phase 0 关键架构决策留档（0001~0004）
 ├── packages/
-│   ├── protocol/                # @nuh/protocol: JSON-RPC 2.0 Schema、事件类型、Codex TS 生成类型封装
-│   ├── core-plugin/             # @nuh/core-plugin: 统一会话映射、Router、Approval Gate 的 Cordis 服务定义
-│   ├── daemon/                  # @nuh/daemon: 宿主启动器，加载 Cordis + DSH 并暴露 stdio/ws JSON-RPC 网关
-│   ├── backend-codex/           # @nuh/backend-codex: 封装 codex app-server（OpenAI 订阅额度 + 审批转发）
-│   ├── backend-claude/          # @nuh/backend-claude: 封装 claude CLI 双向 stream-json / ACP
-│   ├── backend-agy/             # @nuh/backend-agy: 封装 agy acp（主）+ agy -p stream-json（备）
-│   ├── mcp-bridge/              # @nuh/mcp-bridge: 将 NUH/DSH 工具与记忆暴露为本地 MCP Server 注入 CLI 后端
-│   ├── policy-sandbox/          # @nuh/policy-sandbox: execpolicy 规则判定 + codex sandbox / dsh-bash-sandbox 适配
-│   ├── tool-apply-patch/        # @nuh/tool-apply-patch: Codex 风格精确多文件 Patch 工具（Cordis 工具插件）
-│   └── cli-repl/                # @nuh/cli-repl: 极简终端入口（仅做输入、流式打印、y/n 审批，不做复杂 TUI）
-└── docs/                        # 架构、协议与 ADR 演进记录
+│   ├── protocol/                # @nuh/protocol: 唯一协议事实来源（Canonical Zod Schema、TS 类型、外部 CLI 报文解析、归一化内部事件）
+│   ├── core/                    # @nuh/core: Daemon 宿主持久化装配（dsh-base + dsh-app-boot）、Router、SessionMappingStore、execpolicy/sandbox 与 apply_patch
+│   ├── dsh-shims/               # @nuh/dsh-shims: 无头运行时桩（webServer/connection）与第三方 dsh-plugin 宿主借用依赖补齐
+│   ├── mcp-bridge/              # @nuh/mcp-bridge: Daemon 常驻状态 MCP Server + 无状态 stdio 转发代理
+│   └── backends/                # @nuh/backends: 统一 AgentBackend 适配器（native-dsh / codex / claude / agy acp）
+├── apps/
+│   └── cli-repl/                # @nuh/cli-repl: 极简纯标准输入输出 REPL（仅依赖 @nuh/protocol，禁止直连底层包）
+└── tests/
+    ├── contract/                # 确定性契约测试（基于 tests/fixtures/ 真实抓包样本）
+    ├── integration/             # 伪造传输/子进程集成测试（禁止调用真实外部 LLM）
+    ├── e2e/                     # 预留本地端到端验收测试
+    ├── evals/                   # 预留 Agent 行为评测集
+    └── fixtures/                # Spike 01 / Spike 04 等真实抓包样本归档
 ```
 
-> **核心纪律**：`packages/` 下除 `@nuh/daemon` 与 `@nuh/protocol` 外，其余能力模块一律实现为**标准 Cordis 插件**（导出 `name`、`inject`、`apply(ctx)`），严禁以 Fork 修改 `node_modules/@deepseek-ai/dsh-*` 源码的方式堆砌业务逻辑。
+> **核心纪律**：
+> 1. **禁止魔改 DSH 核心**：严禁复制或修改 `@deepseek-ai/dsh-base` 源码；扩展通过标准 Cordis 插件实现，兼容桩沉淀在 `@nuh/dsh-shims` 并附回归测试。
+> 2. **协议即边界**：`apps/*` 仅允许依赖 `@nuh/protocol`，禁止越界直连 `@nuh/core` / `@nuh/backends` / `@deepseek-ai/*`；后端适配器必须完成事件归一化再上送。
 
 ---
 
 ## 4. 详细阶段工作分解（WBS）
 
-### Phase 0：可行性验证与契约锁定（预计 1 周）
-> **目标**：用 5 个独立 Spike 消除外部依赖不确定性，产出真实可用的接口基准。具体执行步骤见 [PHASE0-CHECKLIST.md](./PHASE0-CHECKLIST.md)。
+### Phase 0：可行性验证与契约锁定（已完成主体 Spike 并归档）
+> 具体实测事实与留档缺口见 [report.md](../report.md) 与 [docs/adr/](./adr/README.md)。
 
-| 任务 ID | 任务内容 | 产出物 | 验收标准（DoD） |
-| :--- | :--- | :--- | :--- |
-| **P0-1** | 补齐/定位 `dsh`、`claude`、`agy` 可执行路径与登录态 | 本机环境配置记录 | 4 个 CLI 均可无报错输出 `--version` 或 `--help` |
-| **P0-2** | 验证 `@deepseek-ai/dsh` 无头加载真实 `dsh-plugin`（如记忆/MCP 插件） | Spike 0.1 脚本 | 不启动 Web UI，可通过 SDK/Cordis 触发插件注册的工具 |
-| **P0-3** | 运行 `codex app-server generate-ts` 并跑通 `thread/start` + `turn/start` + 审批流 | Spike 0.2 脚本 + 生成类型 | 用 Node 脚本驱动 `codex app-server` 完成一轮带工具调用的对话 |
-| **P0-4** | 验证 `codex sandbox` 断网与拒绝日志捕获能力 | Spike 0.3 脚本 | 验证禁止外网与越界写时返回预期退出码及 denial 信息 |
-| **P0-5** | 验证 `claude` 双向 `stream-json`（含 `--mcp-config`）与 `agy acp` | Spike 0.4 / 0.5 脚本 | 分别用 Node 子进程完成多轮对话与流式事件解析 |
-| **P0-6** | 根据实测结果冻结 `NUH Protocol v0.1` | 定稿 `PROTOCOL-v0.1.md` | 覆盖 Thread/Turn/Item/Approval/BackendSwitch 全生命周期 |
-
----
-
-### Phase 1：Headless 内核成型与 API 主力可用（预计 2–3 周）
-> **目标**：交付可作为基础日常编码助手的 **NUH v0.1**（API 直连模式 + 原生 `dsh-plugin` 100% 兼容）。
-
-1. **P1-1 Monorepo 初始化与 DSH 底座挂载**
-   - 建立 `pnpm` 工作区与 TypeScript 构建链（支持 ESM + Node 26 原生/tsx 开发运行）。
-   - 在 `@nuh/daemon` 中通过程序化方式启动 Cordis 容器并加载 `@deepseek-ai/dsh-base` 与 `profiles/default/cordis.patch.yml`。
-2. **P1-2 `@nuh/protocol` 与 `@nuh/daemon` 网关**
-   - 实现 JSON-RPC 2.0 传输层（首期支持 `stdio://` 与本地 `ws://127.0.0.1:<port>`）。
-   - 实现核心 RPC：`initialize`、`thread/create`、`thread/resume`、`turn/start`、`turn/interrupt`、`approval/respond`、`plugin/list`。
-   - 将 DSH 的会话事件与工具审批流桥接为统一的 `item/started`、`item/delta`、`item/completed`、`approval/requested` 通知。
-3. **P1-3 多模型 API 路由配置**
-   - 接入 OpenAI API、Anthropic API、DeepSeek API、Gemini API 及自定义 OpenAI-Compatible 端点。
-   - 支持在配置或 `turn/start` 级别指定 `provider/model` 别名（如 `fast`、`coding`、`reasoning`）。
-4. **P1-4 极简 `cli-repl` 与 DSH 插件实测**
-   - 实现极简命令行入口 `nuh`：连接 Daemon、流式打印文本与工具调用、遇到高危操作阻塞等待 `y/n/always` 审批。
-   - 实测直接通过配置安装并启用至少 2 个上游社区 `dsh-plugin`（如 `dsh-mcp-hub`、`dsh-mnemon`）。
-
-- **Phase 1 里程碑 DoD**：日常可在本地代码库通过 `nuh` + 主流 API 完成读写改查与命令执行，且第三方 `dsh-plugin` 无需修改源码即可在 NUH 中生效。
-- **Scope Guard（明确不做）**：不做多端 UI、不做 CLI 后端（留给 Phase 2）、不自研沙箱。
+| Spike / 任务 | 实际结论 |
+| :--- | :--- |
+| **Spike 01：`codex app-server`** | 导出 TS 绑定，无 `OPENAI_API_KEY` 跑通 ChatGPT Plus 订阅态工具调用与审批；发现下行省略 `"jsonrpc"`、服务端 `id` 从 `0` 递增、`turn/completed` 仅返回 `itemsView: "summary"`、线上响应含额外字段需 `.passthrough()` |
+| **Spike 02：`dsh-base` 无头** | 锁定 `@deepseek-ai/dsh-base@0.2.2-rc.1` 与 `dsh-app-boot` 自组装 Profile；明确 `dsh-mnemon`（`profileContext` + `settings` + 禁用 `hmr`）与 `@opfield/dsh-mcp-hub`（`webServer`/`connection` 桩 + 5 个宿主借用包）缺口 |
+| **Spike 03：`codex sandbox`** | 尚未建立脚本，留待 Phase 3 沙箱增强前补测 |
+| **Spike 04：`agy` CLI** | 锁定单轨 `agy acp --stdio`（支持字符串服务端 `id: "1"` 与双向 `allow`/`deny` 审批、跨进程 `session/resume`）；否决 `-p stream-json` 降级路径（无审批拦截且冷启慢） |
+| **Spike 05：MCP Bridge** | Codex `-c mcp_servers...` 动态注入实调成功；发现 Codex 会拉起多个 stdio 子进程，确立“状态常驻 Daemon、stdio 入口仅作无状态转发代理”架构 |
 
 ---
 
-### Phase 2：多 CLI 后端与 OpenAI 订阅额度打通（预计 3–4 周）
-> **目标**：打通 OpenAI 订阅额度、Claude Code CLI、Antigravity CLI，实现统一入口多后端无缝调度。
+### Phase 1：治理基建、协议事实来源与 Headless 内核 MVP
+> **目标**：先立起质量门禁与 `@nuh/protocol` 唯一契约，再构建基于 `dsh-base + dsh-app-boot` 的无头 Daemon 与纯 stdio REPL。
 
-1. **P2-1 统一 `AgentBackend` 服务契约与会话映射**
-   - 在 `@nuh/core-plugin` 定义 Cordis 服务 `ctx.nuhBackends`，统一管理四类后端：`native-dsh`（API 直连）、`codex`、`claude`、`agy`。
-   - 落地 `SessionMappingStore`（SQLite 或 JSONL 索引），维护 `nuh_thread_id ↔ { backendType, backendSessionId, workdir }` 映射与跨后端上下文摘要同步。
-2. **P2-2 `@nuh/backend-codex`（OpenAI 订阅主通道）**
-   - 托管 `codex app-server --listen stdio://` 生命周期（含健康检查、崩溃重启、超时终止）。
-   - 对接 `initialize`、`thread/start`、`thread/resume`、`turn/start`、`turn/interrupt`。
-   - 将 Codex 的 `commandExecution` / `fileChange` 服务端审批请求映射为 NUH 标准 `approval/requested` 事件。
-   - 启动前检测 `codex` 登录状态，未登录时引导提示执行 `codex login`。
-3. **P2-3 `@nuh/backend-claude`（Claude Code CLI 桥接）**
-   - 封装 `claude --input-format stream-json --output-format stream-json --verbose --permission-prompt-tool stdio`（或备选 `claude-agent-acp`）。
-   - 解析 NDJSON 流映射为统一 `item/*` 事件，支持 `--resume <session-id>` 恢复多轮会话。
-4. **P2-4 `@nuh/backend-agy`（Antigravity CLI 桥接）**
-   - 主路径封装 `agy acp`（JSON-RPC over stdin/stdout），维持长驻会话状态。
-   - 兜底路径支持 `agy -p "<prompt>" --output-format stream-json`，当 ACP 模式异常或仅需一次性任务时无缝降级。
-5. **P2-5 `@nuh/mcp-bridge`（消除记忆与工具割裂）**
-   - 在 NUH Daemon 内起一个轻量本地 MCP Server（stdio 代理或本地 HTTP/SSE），将选定的 Cordis 工具（如项目记忆检索、规范检查、自定义工具）统一暴露。
-   - 启动 `codex`（通过临时/动态 MCP 配置）与 `claude`（通过 `--mcp-config`）时自动注入该桥接端点，使外部 CLI 后端也能调用 NUH 插件能力。
-6. **P2-6 跨后端委派（Subagent Delegation）**
-   - 注册 Cordis 工具 `delegate_to_backend(backend, task, contextSummary)`，允许主控 Agent（例如使用 API 或 Codex）将特定子任务（如代码审查、多视角诊断）派发给 `claude` 或 `agy` 并回收结构化结果。
+1. **P1-0 治理基建与 `@nuh/protocol`（本阶段首要落地）**
+   - 补齐 `pnpm-workspace.yaml` 5 个 DSH `allowBuilds` 白名单。
+   - 建立 `tests/{contract,integration,e2e,evals,fixtures}` 分层、Biome + 模块边界检查、`.github/workflows/ci.yml`（`Lint -> Typecheck -> Unit & Contract -> Build -> Fake Integration`）。
+   - 在 `@nuh/protocol` 落地 Canonical Zod Schema、TypeScript 类型、归一化内部事件与 Spike 01/04 确定性契约测试。
+2. **P1-1 DSH 无头基座自组装与 `@nuh/dsh-shims`**
+   - 在 `@nuh/core` 通过 `dsh-app-boot`（`initProfile` + `loadProfileDirectory` + `createRuntimeResolution`）程序化拉起 `@deepseek-ai/dsh-base@0.2.2-rc.1`（不采用依赖 `cmdlineArgs` 的 `dsh-headless` / `dsh-sdk-minimal`）。
+   - 在 `@nuh/dsh-shims` 实现最小 `webServer` / `connection` 无头桩、`profileContext`（禁用 `hmr`）以及 `@opfield/dsh-mcp-hub` 的宿主借用包提供逻辑。
+3. **P1-2 JSON-RPC 2.0 守护网关与核心调度**
+   - 在 `@nuh/core` 实现 `stdio://` 与本地 `ws://127.0.0.1:<port>`（带 capability token）网关，消费 `@nuh/protocol` 契约。
+   - 实现 `initialize`、`thread/start`、`thread/resume`、`thread/list`、`thread/setBackend`、`turn/start`、`turn/interrupt`、`approval/requested`。
+4. **P1-3 极简 `@nuh/cli-repl` 与 DSH 插件实测**
+   - 在 `apps/cli-repl` 实现纯标准输入输出客户端（仅依赖 `@nuh/protocol`），支持流式打印与 `y/n/always` 审批响应。
+   - 实测无头启用 `dsh-mnemon` 与 `@opfield/dsh-mcp-hub`。
 
-- **Phase 2 里程碑 DoD**：可在同一个 `nuh` 会话中自由切换或子任务委派 `API`、`Codex(订阅)`、`Claude CLI`、`agy CLI`，且 CLI 后端可通过 MCP 读取 NUH 挂载的记忆/工具插件。
+- **Scope Guard（Phase 1 明确不做）**：不做任何 TUI/Web/Desktop UI 框架、不实现自研沙箱。
 
 ---
 
-### Phase 3：Codex 级“全面性”与生产可靠性加固（预计 3–4 周）
-> **目标**：补齐工程护城河，在安全边界、代码编辑精度、长程上下文与多任务隔离上达到主流主力 Harness 水准。
+### Phase 2：多 CLI 后端与 `@nuh/mcp-bridge`
+> **目标**：在 `@nuh/backends` 与 `@nuh/mcp-bridge` 打通 OpenAI 订阅、`agy acp`、`claude` 接口与跨后端记忆工具注入。
 
-1. **P3-1 `execpolicy` 命令策略引擎（`@nuh/policy-sandbox`）**
-   - 引入结构化命令前缀/语法判定器（直接封装 Codex 开源 `execpolicy` 规则格式，支持项目级 `.nuh/execpolicy.rules`）。
-   - 实现 `allow`（自动放行如 `git status`、`rg`、`pnpm test`）、`prompt`（弹审批）、`forbid`（硬拦截如 `rm -rf /`、破坏性推库）三态决策，并作用于 `native-dsh` 与所有需外部审批的 CLI 后端。
-2. **P3-2 OS 沙箱对齐与 `apply_patch` 工具**
-   - 对比 `@deepseek-ai/dsh-bash-sandbox` 与 `codex sandbox` 行为，在 macOS/Linux 上为 `dsh-shell` seam 提供可选的 `codex-sandbox` Provider（支持 `--sandbox-state-disable-network` 与 `--log-denials` 拒绝原因回传给模型，避免模型盲目重试）。
-   - 实现 `@nuh/tool-apply-patch` Cordis 工具插件，提供 Codex 风格精确上下文 Patch 语法与工作区越界校验。
-3. **P3-3 `SKILL.md` 通用技能加载与 Context Compaction**
-   - 兼容读取 `.agents/skills/`、`.claude/skills/` 与全局技能目录中的 `SKILL.md`（按需注入摘要，调用时加载全文）。
-   - 实现跨后端统一的会话自动压缩（Compaction）：当历史上下文接近阈值或切换后端时，生成结构化交接摘要并落盘归档。
-4. **P3-4 Git Worktree 隔离与全链路审计**
-   - 提供 `worktree` 执行模式开关（高风险/并行任务自动在临时 `git worktree` 中运行，验收后合并回主工作区）。
-   - 落盘统一 JSONL 审计日志（含每次工具输入输出、沙箱模式、审批人决策、Token 费用或订阅调用计数）。
-
-- **Phase 3 里程碑 DoD**：具备完善的防误操作策略、断网沙箱与 Worktree 隔离；长程重构任务不易因上下文溢出中断；全量操作可审计、可回放。
-
----
-
-### Phase 4：前端接入与“方案 B 决策门”（长期演进）
-1. **Part A：独立前端接入（零核心返工）**
-   - 基于冻结演进的 `NUH JSON-RPC Protocol`，任意开发独立前端：
-     - **终端派**：基于 Ink / OpenTUI / Rust Ratatui 的全功能 TUI；
-     - **桌面/Web 派**：Web UI 或 Electron / Tauri 客户端，或直接作为 ACP Server 接入 Zed / JetBrains / VS Code。
-2. **Part B：向独立引擎（方案 B）迁移的触发条件与方式**
-   - **仅当同时满足以下至少 2 项时才启动重构**（否则留在方案 C 持续迭代）：
-     1. 多子 Agent 并发时 Node.js 内存或冷启动耗时明显影响体验；
-     2. 上游 DSH 长期停更或引入不可调和的破坏性变更；
-     3. 强烈需要零运行时依赖的跨平台单文件分发。
-   - **迁移方式（Strangler Fig）**：用 Rust（可参考/基于 Apache-2.0 的 `codex-rs` 核心模块）实现 `NUH Core Daemon`，保留一个仅加载 Cordis 的极简 Node.js **`dsh-plugin-host` Sidecar**，通过 JSON-RPC / MCP 向新内核暴露 `dsh-plugin` 能力。前端与上层工作流 **0 感知**。
+1. **P2-1 统一 `AgentBackend` 契约与 `SessionMappingStore`**
+   - 在 `@nuh/core` 维护 `nuh_thread_id <-> { backendType, backendSessionId, workdir }` 与统一主账本 `ledger.jsonl`。
+2. **P2-2 `codex` 后端适配器（`@nuh/backends`）**
+   - 托管 `codex app-server --stdio`，显式绑定 `SIGINT`/`SIGTERM`/`exit` 清理钩子。
+   - 使用 `@nuh/protocol` 宽容解析（允许省略 `jsonrpc`、`.passthrough()` 扩展字段、`id !== undefined && method !== undefined` 区分服务端审批请求），订阅流式 `item/*` 归档完整日志（不依赖 `turn/completed` 的 `summary` 视图）。
+3. **P2-3 `claude` 后端适配器（`@nuh/backends`）**
+   - 预留双向 `stream-json` + `--permission-prompt-tool stdio` + `--resume` 适配器，待有效登录态后补齐实测 Fixtures 与契约测试。
+4. **P2-4 `agy` 后端适配器（`@nuh/backends`，单轨锁定 `agy acp --stdio`）**
+   - 仅实现 `agy acp --stdio` 常驻模式：支持 `initialize`、`session/new`、`session/resume`、`session/set_config_option`、`session/prompt` 与字符串 `id` 的 `session/request_permission`。
+   - **已删除 `-p --output-format stream-json` 降级路径**：子进程崩溃后由 `ProcessSupervisor` 重启 `agy acp --stdio` 并调用 `session/resume` 恢复。
+5. **P2-5 `@nuh/mcp-bridge`（Daemon 常驻状态 + 无状态 stdio 转发代理）**
+   - MCP 工具注册与状态常驻 `@nuh/core` Daemon 进程内（本地回环 HTTP/IPC）；CLI 拉起的 stdio 入口仅作无状态转发代理，避免 Codex 多进程拉起导致状态分叉。
+6. **P2-6 跨后端委派**
+   - 注册标准 Cordis 工具支持主控 Agent 跨后端派发只读或受控子任务。
 
 ---
 
-## 5. 总体时间线估算（按单人业余/集中投入双口径）
+### Phase 3：安全策略、沙箱强化与生产可靠性
+1. **P3-1 `execpolicy` 命令策略引擎（`@nuh/core`）**：三级规则覆盖 + `allow`/`prompt`/`forbid` 判定。
+2. **P3-2 OS 沙箱对齐与 `apply_patch`**：补跑 Spike 03 验证 `codex sandbox --sandbox-state-disable-network --log-denials` 拒绝日志回传。
+3. **P3-3 `SKILL.md` 通用加载与 Context Compaction**。
+4. **P3-4 Git Worktree 隔离与 JSONL 全链路审计**。
 
-| 阶段 | 核心产出 | 集中全职投入 | 业余碎片投入（每周 ~12h） |
-| :--- | :--- | :--- | :--- |
-| **Phase 0** | 5 个 Spike 验证 + 协议定稿 | 3–5 天 | 1–1.5 周 |
-| **Phase 1** | 可用 Headless MVP（API + DSH 插件） | 1.5–2 周 | 3–4 周 |
-| **Phase 2** | Codex 订阅 + Claude/AGY CLI + MCP 桥 | 2–3 周 | 4–6 周 |
-| **Phase 3** | `execpolicy` + 沙箱强化 + Skills + Worktree | 2–3 周 | 4–6 周 |
-| **合计（达日常主力完全体）** | **Phase 0 → Phase 3** | **约 6–9 周** | **约 3–4 个月** |
+---
+
+### Phase 4：独立前端接入与“方案 B 决策门”
+- **Part A**：Phase 3 验收完成后，基于冻结演进的 `@nuh/protocol` 接入独立 TUI / Web / Desktop / IDE 客户端。
+- **Part B**：仅当满足至少 2 项触发条件时（多子 Agent 内存/冷启瓶颈、DSH 上游停更或破坏性变更、强制单文件零运行时分发），通过 Strangler Fig 迁移至独立引擎 + `dsh-plugin-host` Sidecar。

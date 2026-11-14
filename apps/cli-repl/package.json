@@ -3,13 +3,22 @@
   "version": "0.1.0",
   "private": true,
   "type": "module",
+  "bin": {
+    "nuh-repl": "./dist/bin.js"
+  },
   "exports": {
     ".": {
       "types": "./src/index.ts",
+      "development": "./src/index.ts",
       "default": "./dist/index.js"
     }
   },
   "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "start": "node ./dist/bin.js",
     "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@nuh/protocol": "workspace:*"
   }
 }
