@@ -1,0 +1,17 @@
+protocol:
+  - changed-files:
+      - any-glob-to-any-file: "packages/protocol/**"
+
+core:
+  - changed-files:
+      - any-glob-to-any-file: "packages/core/**"
+
+backends:
+  - changed-files:
+      - any-glob-to-any-file: "packages/backends/**"
+
+documentation:
+  - changed-files:
+      - any-glob-to-any-file:
+          - "docs/**"
+          - "*.md"
