@@ -1,5 +1,11 @@
 import { randomUUID } from 'node:crypto';
-import { type BackendKind, type NuhNormalizedEvent, NuhNormalizedEventSchema } from '@nuh/protocol';
+import type { AgentBackend, BackendTurnRequest } from '@nuh/backends';
+import {
+  type BackendKind,
+  type BackendStatus,
+  type NuhNormalizedEvent,
+  NuhNormalizedEventSchema,
+} from '@nuh/protocol';
 
 export interface EchoTurnParams {
   readonly threadId: string;
@@ -189,4 +195,42 @@ export async function runEchoTurn(params: EchoTurnParams): Promise<void> {
       },
     },
   });
+}
+
+/**
+ * `native-dsh` 默认 Echo 适配器（Phase 1 无头基座确定性闭环实现）。
+ */
+export class NativeDshEchoBackend implements AgentBackend {
+  readonly kind = 'native-dsh' as const;
+  private readonly stepDelayMs: number | undefined;
+
+  constructor(stepDelayMs?: number) {
+    this.stepDelayMs = stepDelayMs;
+  }
+
+  async getStatus(): Promise<BackendStatus> {
+    return {
+      kind: 'native-dsh',
+      available: true,
+      authenticated: true,
+      version: '0.2.2-rc.1',
+      reason: 'headless deterministic echo loop active',
+    };
+  }
+
+  async runTurn(request: BackendTurnRequest): Promise<void> {
+    await runEchoTurn({
+      threadId: request.threadId,
+      turnId: request.turnId,
+      backend: 'native-dsh',
+      input: request.prompt,
+      signal: request.signal,
+      ...(this.stepDelayMs !== undefined ? { stepDelayMs: this.stepDelayMs } : {}),
+      emit: request.emit,
+    });
+  }
+
+  async dispose(): Promise<void> {
+    // no external subprocess owned
+  }
 }

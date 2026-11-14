@@ -8,12 +8,14 @@ import {
   BackendKindSchema,
   ItemCompletedParamsSchema,
   ItemDeltaParamsSchema,
+  type ItemKind,
   ItemStartedParamsSchema,
   type LedgerSummaryEntry,
   NUH_ERROR_CODES,
   type NuhNormalizedEvent,
   NuhProtocolError,
   SandboxModeSchema,
+  ThoughtLevelSchema,
   TurnCompletedParamsSchema,
   TurnStartedParamsSchema,
 } from '@nuh/protocol';
@@ -30,6 +32,7 @@ export const LedgerThreadStartedPayloadSchema = z.object({
 export const LedgerThreadBackendChangedPayloadSchema = z.object({
   backend: BackendKindSchema,
   model: z.string().min(1).optional(),
+  thoughtLevel: ThoughtLevelSchema.optional(),
 });
 
 export const LedgerTurnInputPayloadSchema = z.object({
@@ -275,6 +278,7 @@ export class AuditLedger {
   async summarizeThread(threadId: string): Promise<LedgerSummaryEntry[]> {
     const records = await this.readThreadEntries(threadId);
     const turnBackends = new Map<string, BackendKind>();
+    const itemKinds = new Map<string, ItemKind>();
     const assistantBuffers = new Map<string, string>();
     const summary: LedgerSummaryEntry[] = [];
 
@@ -287,23 +291,82 @@ export class AuditLedger {
           summary: record.payload.input,
           timestamp: record.ts,
         });
+      } else if (record.kind === 'item/started') {
+        itemKinds.set(record.payload.itemId, record.payload.kind);
       } else if (record.kind === 'item/delta' && record.payload.channel === 'text') {
         const prev = assistantBuffers.get(record.payload.itemId) ?? '';
         assistantBuffers.set(record.payload.itemId, `${prev}${record.payload.delta}`);
       } else if (record.kind === 'item/completed') {
+        const itemKind = itemKinds.get(record.payload.itemId);
+        const backend = turnBackends.get(record.payload.turnId) ?? 'native-dsh';
         const buffered = assistantBuffers.get(record.payload.itemId);
-        if (buffered !== undefined) {
+        if (buffered !== undefined && (!itemKind || itemKind === 'agent_message')) {
           summary.push({
             role: 'assistant',
-            backend: turnBackends.get(record.payload.turnId) ?? 'native-dsh',
+            backend,
             summary: buffered,
             timestamp: record.ts,
           });
           assistantBuffers.delete(record.payload.itemId);
+        } else if (
+          itemKind &&
+          itemKind !== 'agent_message' &&
+          itemKind !== 'reasoning' &&
+          record.payload.summary
+        ) {
+          const toolLabel =
+            typeof record.payload.summary.command === 'string'
+              ? record.payload.summary.command
+              : typeof record.payload.summary.title === 'string'
+                ? record.payload.summary.title
+                : typeof record.payload.summary.name === 'string'
+                  ? record.payload.summary.name
+                  : itemKind;
+          summary.push({
+            role: 'tool',
+            backend,
+            summary: `${toolLabel} (${record.payload.status})`,
+            timestamp: record.ts,
+          });
         }
       }
     }
 
     return summary;
   }
+}
+
+const MAX_HANDOFF_ENTRIES = 10;
+const MAX_HANDOFF_ENTRY_CHARS = 400;
+
+/**
+ * 跨后端切换时的“摘要接力（Handoff Summary）”构造器：
+ * 仅从统一主账本 `ledger.jsonl` 提取近期上下文摘要注入新后端，不做底层进程状态同步。
+ */
+export function buildHandoffPrompt(
+  userInput: string,
+  entries: readonly LedgerSummaryEntry[],
+  fromBackend: BackendKind,
+  toBackend: BackendKind,
+): string {
+  if (entries.length === 0) {
+    return userInput;
+  }
+  const recent = entries.slice(-MAX_HANDOFF_ENTRIES);
+  const lines = recent.map((entry) => {
+    const normalized = entry.summary.replace(/\s+/g, ' ').trim();
+    const clipped =
+      normalized.length > MAX_HANDOFF_ENTRY_CHARS
+        ? `${normalized.slice(0, MAX_HANDOFF_ENTRY_CHARS)}...`
+        : normalized;
+    return `- [${entry.role} via ${entry.backend}] ${clipped}`;
+  });
+  return [
+    `[NUH Handoff Summary (${fromBackend} -> ${toBackend})]`,
+    'Recent conversation context from canonical ledger:',
+    ...lines,
+    '',
+    '[Current User Request]',
+    userInput,
+  ].join('\n');
 }

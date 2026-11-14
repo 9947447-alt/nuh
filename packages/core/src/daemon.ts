@@ -2,9 +2,25 @@ import { randomUUID } from 'node:crypto';
 import { createInterface } from 'node:readline';
 import type { Readable, Writable } from 'node:stream';
 import {
+  type BackendMcpServerConfig,
+  type BackendRegistry,
+  createDefaultBackendRegistry,
+} from '@nuh/backends';
+import { HeadlessMnemonExecutor } from '@nuh/dsh-shims';
+import {
+  createMcpBridgeLaunchSpec,
+  McpBridgeIpcServer,
+  type McpBridgeJsonSchemaObject,
+  type McpBridgeToolProvider,
+} from '@nuh/mcp-bridge';
+import {
+  type ApprovalRequestedParams,
+  ApprovalRequestedParamsSchema,
+  type ApprovalRequestedResult,
+  ApprovalRequestedResultSchema,
   type BackendKind,
-  type BackendStatus,
   classifyJsonRpcMessage,
+  formatZodValidationError,
   type InitializeResult,
   type JsonRpcId,
   JsonRpcIdSchema,
@@ -17,6 +33,7 @@ import {
   parseNuhClientNotification,
   parseNuhClientRequest,
   serializeNdjsonLine,
+  type ThoughtLevel,
   type ThreadSummary,
   toNuhNotification,
 } from '@nuh/protocol';
@@ -25,14 +42,17 @@ import {
   type DshHeadlessBootOptions,
   type DshHeadlessRuntime,
 } from './dsh-runtime.ts';
-import { runEchoTurn } from './echo-backend.ts';
-import { AuditLedger, resolveDefaultNuhHome } from './ledger.ts';
+import { NativeDshEchoBackend } from './echo-backend.ts';
+import { AuditLedger, buildHandoffPrompt, resolveDefaultNuhHome } from './ledger.ts';
 
 interface ThreadRecord {
   readonly threadId: string;
   readonly workdir: string;
   activeBackend: BackendKind;
+  lastExecutedBackend: BackendKind | null;
   model?: string;
+  thoughtLevel?: ThoughtLevel;
+  readonly backendSessions: Map<BackendKind, string>;
   readonly sandboxMode: 'read-only' | 'workspace-write' | 'danger-full-access';
   readonly approvalPolicy: 'untrusted' | 'on-request' | 'never';
   readonly createdAt: string;
@@ -46,12 +66,42 @@ interface ActiveTurnRecord {
   readonly done: Promise<void>;
 }
 
+interface PendingApprovalRecord {
+  readonly resolve: (result: ApprovalRequestedResult) => void;
+  readonly reject: (reason: Error) => void;
+}
+
 export interface NuhDaemonOptions {
   readonly dshOptions?: DshHeadlessBootOptions;
   readonly nuhHome?: string;
   readonly echoStepDelayMs?: number;
   readonly runtime?: DshHeadlessRuntime;
+  readonly backendRegistry?: BackendRegistry;
+  readonly enableMcpBridge?: boolean;
   readonly stderr?: Writable;
+}
+
+function isJsonSchemaObject(schema: unknown): schema is McpBridgeJsonSchemaObject {
+  return (
+    typeof schema === 'object' &&
+    schema !== null &&
+    !Array.isArray(schema) &&
+    'type' in schema &&
+    schema.type === 'object'
+  );
+}
+
+function toBackendMcpServerConfig(socketPath: string, cwd?: string): BackendMcpServerConfig {
+  const launch = createMcpBridgeLaunchSpec({
+    socketPath,
+    ...(cwd ? { cwd } : {}),
+  });
+  return {
+    name: launch.serverName,
+    command: launch.command,
+    args: launch.args,
+    env: launch.env,
+  };
 }
 
 function extractValidRpcId(raw: unknown): JsonRpcId | null {
@@ -64,47 +114,112 @@ function extractValidRpcId(raw: unknown): JsonRpcId | null {
 }
 
 /**
- * NUH 无头守护进程内核（Phase 1 Step 1.2）：
+ * NUH 无头守护进程内核（Phase 1 Step 1.3）：
  * - 托管 `@deepseek-ai/dsh-base` 无头 Cordis 容器生命周期
- * - 通过 `stdio://` NDJSON 暴露 `@nuh/protocol` JSON-RPC 2.0 服务端
- * - 将规范化 Thread / Turn / Item 事件追加写入 `ledger.jsonl`
+ * - 通过 `@nuh/backends` 注册表调度 `native-dsh` / `codex` / `agy`（及预留 `claude`）后端
+ * - 通过 `stdio://` NDJSON 暴露 `@nuh/protocol` JSON-RPC 2.0 服务端与双向 `approval/requested` 审批通道
+ * - 跨后端切换时从 `ledger.jsonl` 提取近期上下文摘要注入新后端（Handoff Summary）
  */
 export class NuhDaemon {
   readonly runtime: DshHeadlessRuntime;
   readonly ledger: AuditLedger;
-  private readonly echoStepDelayMs: number | undefined;
+  readonly backends: BackendRegistry;
   private readonly stderr: Writable;
+  private readonly mcpServer: McpBridgeIpcServer | undefined;
+  private readonly mnemonExecutor: HeadlessMnemonExecutor | undefined;
   private readonly threads = new Map<string, ThreadRecord>();
   private readonly knownTurnIds = new Map<string, string>();
   private readonly activeTurns = new Map<string, ActiveTurnRecord>();
+  private readonly pendingApprovals = new Map<JsonRpcId, PendingApprovalRecord>();
+  private nextServerRequestSeq = 1;
   private initialized = false;
   private shutdownPromise: Promise<void> | null = null;
   private closeStdio: (() => void) | null = null;
 
-  private constructor(runtime: DshHeadlessRuntime, ledger: AuditLedger, options: NuhDaemonOptions) {
+  private constructor(
+    runtime: DshHeadlessRuntime,
+    ledger: AuditLedger,
+    options: NuhDaemonOptions,
+    mcpServer?: McpBridgeIpcServer,
+    mnemonExecutor?: HeadlessMnemonExecutor,
+  ) {
     this.runtime = runtime;
     this.ledger = ledger;
-    this.echoStepDelayMs = options.echoStepDelayMs;
     this.stderr = options.stderr ?? process.stderr;
+    this.mcpServer = mcpServer;
+    this.mnemonExecutor = mnemonExecutor;
+    const defaultMcpServers = mcpServer
+      ? [toBackendMcpServerConfig(mcpServer.socketPath, options.dshOptions?.cwd)]
+      : undefined;
+    this.backends =
+      options.backendRegistry ??
+      createDefaultBackendRegistry({
+        logger: (level, message, meta) => {
+          this.logDiagnostic(level === 'debug' ? 'info' : level, message, meta);
+        },
+        ...(defaultMcpServers ? { mcpServers: defaultMcpServers } : {}),
+        nativeBackend: new NativeDshEchoBackend(options.echoStepDelayMs),
+      });
+  }
+
+  get mcpSocketPath(): string | undefined {
+    return this.mcpServer?.socketPath;
   }
 
   static async create(options: NuhDaemonOptions = {}): Promise<NuhDaemon> {
     const runtime = options.runtime ?? (await bootDshHeadlessRuntime(options.dshOptions));
     const nuhHome = options.nuhHome ?? resolveDefaultNuhHome();
     const ledger = new AuditLedger(nuhHome);
-    const daemon = new NuhDaemon(runtime, ledger, options);
+    const defaultWorkspace = options.dshOptions?.cwd ?? process.cwd();
+    const enableMcpBridge = options.enableMcpBridge ?? true;
 
-    const coreFiber = runtime.ctx.plugin({
-      name: 'nuh-daemon-core',
-      apply(ctx) {
-        ctx.effect(() => () => {
-          daemon.abortAllActiveTurns();
+    let mnemonExecutor: HeadlessMnemonExecutor | undefined;
+    let mcpServer: McpBridgeIpcServer | undefined;
+
+    try {
+      if (enableMcpBridge) {
+        mnemonExecutor = new HeadlessMnemonExecutor(runtime.ctx, defaultWorkspace);
+        const executorRef = mnemonExecutor;
+        const provider: McpBridgeToolProvider = {
+          listTools: () =>
+            executorRef.listTools().map((tool) => ({
+              name: tool.name,
+              description: tool.description,
+              inputSchema: isJsonSchemaObject(tool.inputSchema)
+                ? tool.inputSchema
+                : { type: 'object' as const, properties: {} },
+              readOnly: true as const,
+            })),
+          callTool: (name, args, callOptions) => executorRef.callTool(name, args, callOptions),
+        };
+        mcpServer = await McpBridgeIpcServer.start({
+          nuhHome,
+          provider,
+          ...(options.stderr ? { stderr: options.stderr } : {}),
         });
-      },
-    });
-    await coreFiber.inertia;
+      }
 
-    return daemon;
+      const daemon = new NuhDaemon(runtime, ledger, options, mcpServer, mnemonExecutor);
+
+      const coreFiber = runtime.ctx.plugin({
+        name: 'nuh-daemon-core',
+        apply(ctx) {
+          ctx.effect(() => () => {
+            daemon.abortAllActiveTurns();
+          });
+        },
+      });
+      await coreFiber.inertia;
+
+      return daemon;
+    } catch (error) {
+      await mcpServer?.dispose();
+      await mnemonExecutor?.dispose();
+      if (!options.runtime) {
+        await runtime.dispose();
+      }
+      throw error;
+    }
   }
 
   private logDiagnostic(level: 'info' | 'warn' | 'error', message: string, meta?: unknown): void {
@@ -119,6 +234,10 @@ export class NuhDaemon {
   }
 
   private abortAllActiveTurns(): void {
+    for (const [id, pending] of this.pendingApprovals.entries()) {
+      this.pendingApprovals.delete(id);
+      pending.resolve({ decision: 'deny', note: 'Daemon shutting down' });
+    }
     for (const turn of this.activeTurns.values()) {
       turn.abortController.abort();
     }
@@ -130,34 +249,46 @@ export class NuhDaemon {
     }
   }
 
-  private getBackendStatuses(): BackendStatus[] {
-    return [
-      {
-        kind: 'native-dsh',
-        available: true,
-        authenticated: true,
-        version: '0.2.2-rc.1',
-        reason: 'headless deterministic echo loop active',
-      },
-      {
-        kind: 'codex',
-        available: false,
-        authenticated: false,
-        reason: 'Phase 2 backend adapter not yet attached',
-      },
-      {
-        kind: 'claude',
-        available: false,
-        authenticated: false,
-        reason: 'Phase 2 backend adapter not yet attached',
-      },
-      {
-        kind: 'agy',
-        available: false,
-        authenticated: false,
-        reason: 'Phase 2 backend adapter not yet attached',
-      },
-    ];
+  private requestClientApproval(
+    output: Writable,
+    params: ApprovalRequestedParams,
+    signal: AbortSignal,
+  ): Promise<ApprovalRequestedResult> {
+    const validatedParams = ApprovalRequestedParamsSchema.parse(params);
+    if (signal.aborted) {
+      return Promise.resolve({ decision: 'deny', note: 'Turn interrupted before approval' });
+    }
+
+    const requestId: JsonRpcId = `srv_req_${String(this.nextServerRequestSeq)}`;
+    this.nextServerRequestSeq += 1;
+
+    return new Promise((resolve, reject) => {
+      const onAbort = (): void => {
+        if (this.pendingApprovals.delete(requestId)) {
+          resolve({ decision: 'deny', note: 'Turn interrupted while awaiting approval' });
+        }
+      };
+
+      this.pendingApprovals.set(requestId, {
+        resolve: (result) => {
+          signal.removeEventListener('abort', onAbort);
+          resolve(result);
+        },
+        reject: (err) => {
+          signal.removeEventListener('abort', onAbort);
+          reject(err);
+        },
+      });
+
+      signal.addEventListener('abort', onAbort, { once: true });
+
+      this.writeFrame(output, {
+        jsonrpc: '2.0',
+        id: requestId,
+        method: 'approval/requested',
+        params: validatedParams,
+      });
+    });
   }
 
   private async handleRequest(req: NuhClientRequest, output: Writable): Promise<unknown> {
@@ -169,7 +300,7 @@ export class NuhDaemon {
             version: '0.1.0',
           },
           protocolVersion: NUH_PROTOCOL_VERSION,
-          backends: this.getBackendStatuses(),
+          backends: await this.backends.listStatuses(),
           loadedDshPlugins: [...this.runtime.loadedPluginIds],
         };
         return result;
@@ -182,7 +313,9 @@ export class NuhDaemon {
           threadId,
           workdir: req.params.workdir,
           activeBackend: req.params.defaultBackend,
+          lastExecutedBackend: null,
           ...(req.params.model !== undefined ? { model: req.params.model } : {}),
+          backendSessions: new Map(),
           sandboxMode: req.params.sandboxMode,
           approvalPolicy: req.params.approvalPolicy,
           createdAt: now,
@@ -245,19 +378,59 @@ export class NuhDaemon {
             { threadId: req.params.threadId },
           );
         }
-        thread.activeBackend = req.params.backend;
-        if (req.params.model !== undefined) {
-          thread.model = req.params.model;
+        const targetBackend = this.backends.require(req.params.backend);
+        const status = await targetBackend.getStatus();
+        if (!status.available) {
+          throw new NuhProtocolError(
+            NUH_ERROR_CODES.BACKEND_UNAVAILABLE,
+            status.reason ?? `后端 "${req.params.backend}" 当前不可用`,
+            {
+              backend: req.params.backend,
+              ...(status.reason !== undefined ? { code: status.reason } : {}),
+            },
+          );
         }
+
+        const switchedBackend = req.params.backend !== thread.activeBackend;
+        if (switchedBackend) {
+          await this.backends.closeThreadOnAll(thread.threadId, req.params.backend);
+          thread.activeBackend = req.params.backend;
+          if (req.params.model !== undefined) {
+            thread.model = req.params.model;
+          } else {
+            delete thread.model;
+          }
+          if (req.params.thoughtLevel !== undefined) {
+            thread.thoughtLevel = req.params.thoughtLevel;
+          } else {
+            delete thread.thoughtLevel;
+          }
+        } else {
+          if (req.params.model !== undefined) {
+            thread.model = req.params.model;
+          }
+          if (req.params.thoughtLevel !== undefined) {
+            thread.thoughtLevel = req.params.thoughtLevel;
+          }
+          if (targetBackend.configureSession) {
+            await targetBackend.configureSession(thread.threadId, {
+              ...(thread.model !== undefined ? { model: thread.model } : {}),
+              ...(thread.thoughtLevel !== undefined ? { thoughtLevel: thread.thoughtLevel } : {}),
+            });
+          }
+        }
+
         thread.updatedAt = new Date().toISOString();
         await this.ledger.appendThreadBackendChanged(thread.threadId, {
           backend: thread.activeBackend,
           ...(thread.model !== undefined ? { model: thread.model } : {}),
+          ...(thread.thoughtLevel !== undefined ? { thoughtLevel: thread.thoughtLevel } : {}),
         });
         return {
           threadId: thread.threadId,
           backend: thread.activeBackend,
           ...(thread.model !== undefined ? { model: thread.model } : {}),
+          ...(thread.thoughtLevel !== undefined ? { thoughtLevel: thread.thoughtLevel } : {}),
         };
       }
 
@@ -271,17 +444,35 @@ export class NuhDaemon {
           );
         }
         const resolvedBackend = req.params.backendOverride ?? thread.activeBackend;
-        if (resolvedBackend !== 'native-dsh') {
+        const backend = this.backends.require(resolvedBackend);
+        const status = await backend.getStatus();
+        if (!status.available) {
           throw new NuhProtocolError(
             NUH_ERROR_CODES.BACKEND_UNAVAILABLE,
-            `后端 "${resolvedBackend}" 尚未在 Phase 1 Step 1.2 接入，当前仅支持 native-dsh`,
-            { resolvedBackend },
+            status.reason ?? `后端 "${resolvedBackend}" 当前不可用`,
+            {
+              resolvedBackend,
+              ...(status.reason !== undefined ? { code: status.reason } : {}),
+            },
           );
         }
 
         const turnId = `nuh_turn_${randomUUID().slice(0, 12)}`;
         thread.updatedAt = new Date().toISOString();
         this.knownTurnIds.set(turnId, thread.threadId);
+
+        const isBackendSwitch =
+          thread.lastExecutedBackend !== null && thread.lastExecutedBackend !== resolvedBackend;
+        const promptForBackend = isBackendSwitch
+          ? buildHandoffPrompt(
+              req.params.input,
+              await this.ledger.summarizeThread(thread.threadId),
+              thread.lastExecutedBackend as BackendKind,
+              resolvedBackend,
+            )
+          : req.params.input;
+        thread.lastExecutedBackend = resolvedBackend;
+
         await this.ledger.appendTurnInput(thread.threadId, {
           turnId,
           backend: resolvedBackend,
@@ -293,23 +484,45 @@ export class NuhDaemon {
           await this.ledger.appendNormalizedEvent(event);
           this.writeFrame(output, toNuhNotification(event));
         };
+        const resolvedModel = req.params.modelOverride ?? thread.model;
+        const existingSessionId = thread.backendSessions.get(resolvedBackend);
 
         const done = (async () => {
           try {
-            await runEchoTurn({
+            await backend.runTurn({
+              threadId: thread.threadId,
+              turnId,
+              workdir: thread.workdir,
+              prompt: promptForBackend,
+              ...(resolvedModel !== undefined ? { model: resolvedModel } : {}),
+              ...(thread.thoughtLevel !== undefined ? { thoughtLevel: thread.thoughtLevel } : {}),
+              sandboxMode: thread.sandboxMode,
+              approvalPolicy: thread.approvalPolicy,
+              ...(this.mcpServer
+                ? {
+                    mcpServers: [
+                      toBackendMcpServerConfig(this.mcpServer.socketPath, thread.workdir),
+                    ],
+                  }
+                : {}),
+              ...(existingSessionId !== undefined ? { backendSessionId: existingSessionId } : {}),
+              onBackendSessionId: (backendSessionId) => {
+                thread.backendSessions.set(resolvedBackend, backendSessionId);
+              },
+              signal: abortController.signal,
+              emit: emitEvent,
+              requestApproval: (approvalParams) =>
+                this.requestClientApproval(output, approvalParams, abortController.signal),
+            });
+          } catch (cause) {
+            const errorCode =
+              cause instanceof NuhProtocolError ? cause.code : NUH_ERROR_CODES.INTERNAL_ERROR;
+            const detail = cause instanceof Error ? cause.message : String(cause);
+            this.logDiagnostic('error', 'Backend turn execution failed', {
               threadId: thread.threadId,
               turnId,
               backend: resolvedBackend,
-              input: req.params.input,
-              signal: abortController.signal,
-              ...(this.echoStepDelayMs !== undefined ? { stepDelayMs: this.echoStepDelayMs } : {}),
-              emit: emitEvent,
-            });
-          } catch (cause) {
-            const detail = cause instanceof Error ? cause.message : String(cause);
-            this.logDiagnostic('error', 'Echo turn execution failed', {
-              threadId: thread.threadId,
-              turnId,
+              code: errorCode,
               detail,
             });
             await emitEvent({
@@ -319,7 +532,7 @@ export class NuhDaemon {
                 turnId,
                 status: 'failed',
                 error: {
-                  code: NUH_ERROR_CODES.INTERNAL_ERROR,
+                  code: errorCode,
                   message: detail,
                 },
               },
@@ -402,9 +615,46 @@ export class NuhDaemon {
         return;
       }
 
+      if (classified.kind === 'response_success') {
+        const pending = this.pendingApprovals.get(classified.message.id);
+        if (!pending) {
+          throw new NuhProtocolError(
+            NUH_ERROR_CODES.INVALID_REQUEST,
+            `收到未匹配的 JSON-RPC Response 帧 (id=${String(classified.message.id)})`,
+          );
+        }
+        this.pendingApprovals.delete(classified.message.id);
+        const parsedResult = ApprovalRequestedResultSchema.safeParse(classified.message.result);
+        if (!parsedResult.success) {
+          const err = formatZodValidationError(
+            'approval/requested 响应载荷校验失败',
+            parsedResult.error,
+            NUH_ERROR_CODES.PROTOCOL_VALIDATION_ERROR,
+          );
+          this.logDiagnostic('error', err.message, { id: classified.message.id });
+          pending.reject(err);
+          return;
+        }
+        pending.resolve(parsedResult.data);
+        return;
+      }
+
+      const id = classified.message.id;
+      if (id !== null) {
+        const pending = this.pendingApprovals.get(id);
+        if (pending) {
+          this.pendingApprovals.delete(id);
+          pending.resolve({
+            decision: 'deny',
+            note: classified.message.error.message,
+          });
+          return;
+        }
+      }
+
       throw new NuhProtocolError(
         NUH_ERROR_CODES.INVALID_REQUEST,
-        `收到未匹配的 JSON-RPC Response 帧 (id=${String(classified.message.id)})`,
+        `收到未匹配的 JSON-RPC Error Response 帧 (id=${String(id)})`,
       );
     } catch (cause) {
       if (cause instanceof NuhProtocolError) {
@@ -462,6 +712,9 @@ export class NuhDaemon {
         this.closeStdio?.();
         this.abortAllActiveTurns();
         await this.waitForActiveTurns();
+        await this.backends.disposeAll();
+        await this.mcpServer?.dispose();
+        await this.mnemonExecutor?.dispose();
         await this.ledger.flush();
         await this.runtime.dispose();
       })();

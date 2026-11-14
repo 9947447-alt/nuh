@@ -1,8 +1,9 @@
-import { existsSync, mkdirSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import path from 'node:path';
 import type { Context } from '@deepseek-ai/cordis';
 import type { PatchOptions } from '@deepseek-ai/cordis-plugin-include';
+import { listMnemonReadOnlyTools, MNEMON_READONLY_TOOL_NAMES } from '@nuh/dsh-shims';
 import '@deepseek-ai/cordis-plugin-loader';
 import {
   boot,
@@ -105,8 +106,9 @@ export async function bootDshHeadlessRuntime(
   const profileDir = resolveProfileDir(profileName, dshHome);
   mkdirSync(profileDir, { recursive: true });
 
-  const bundles = ['@deepseek-ai/dsh-base'] as const;
+  const bundles = ['@deepseek-ai/dsh-base', 'dsh-mnemon'] as const;
   initProfile(profileDir, bundles);
+  ensureProfileBundles(profileDir, bundles);
 
   const installAnchor = path.resolve(import.meta.dirname, '../package.json');
   const profile = loadProfileDirectory(binName, profileDir, installAnchor);
@@ -156,6 +158,7 @@ export async function bootDshHeadlessRuntime(
   });
 
   await ctx.get('loader')?.await();
+  await settleMnemonCatalog(ctx);
 
   const activeEntries = collectActiveEntries(ctx);
   const loadedPluginIds = activeEntries.map((entry) => entry.id);
@@ -190,4 +193,66 @@ export async function bootDshHeadlessRuntime(
       await disposePromise;
     },
   };
+}
+
+function isPlainObject(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+function ensureProfileBundles(profileDir: string, requiredBundles: readonly string[]): void {
+  const pkgPath = path.join(profileDir, 'package.json');
+  if (!existsSync(pkgPath)) {
+    return;
+  }
+  const raw: unknown = JSON.parse(readFileSync(pkgPath, 'utf8'));
+  if (!isPlainObject(raw)) {
+    return;
+  }
+  const dsh = isPlainObject(raw.dsh) ? raw.dsh : {};
+  const profile = isPlainObject(dsh.profile) ? dsh.profile : {};
+  const currentBundles = Array.isArray(profile.bundles)
+    ? profile.bundles.filter((item): item is string => typeof item === 'string')
+    : [];
+  const nextBundles = [...currentBundles];
+  let changed = false;
+  for (const bundle of requiredBundles) {
+    if (!nextBundles.includes(bundle)) {
+      nextBundles.push(bundle);
+      changed = true;
+    }
+  }
+  if (!changed) {
+    return;
+  }
+  const updated = {
+    ...raw,
+    dsh: {
+      ...dsh,
+      profile: {
+        ...profile,
+        bundles: nextBundles,
+      },
+    },
+  };
+  writeFileSync(pkgPath, `${JSON.stringify(updated, null, 2)}\n`, 'utf8');
+}
+
+/**
+ * dsh-mnemon schedules async `memoryPlugins.catalog()` in a `loader.await()`
+ * continuation. Waiting briefly for its read-only tools plus one short settle
+ * turn prevents teardown races when callers shut down right after boot.
+ */
+async function settleMnemonCatalog(ctx: Context): Promise<void> {
+  const deadlineMs = Date.now() + 500;
+  while (Date.now() < deadlineMs) {
+    if (listMnemonReadOnlyTools(ctx).length >= MNEMON_READONLY_TOOL_NAMES.length) {
+      await new Promise<void>((resolve) => {
+        setTimeout(resolve, 80);
+      });
+      return;
+    }
+    await new Promise<void>((resolve) => {
+      setTimeout(resolve, 15);
+    });
+  }
 }
