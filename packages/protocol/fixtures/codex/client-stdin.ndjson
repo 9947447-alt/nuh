@@ -1,0 +1,7 @@
+{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"clientInfo":{"name":"nuh-spike-01","title":"NUH Phase 0 Spike 01","version":"0.1.0"},"capabilities":{"experimentalApi":false,"requestAttestation":false}}}
+{"jsonrpc":"2.0","method":"initialized"}
+{"jsonrpc":"2.0","id":2,"method":"account/read","params":{"refreshToken":false}}
+{"jsonrpc":"2.0","id":3,"method":"getAuthStatus","params":{"includeToken":false,"refreshToken":false}}
+{"jsonrpc":"2.0","id":4,"method":"thread/start","params":{"cwd":"/Users/a0000/Developer/NUH-Phase0-Check&Plan","approvalPolicy":"untrusted","sandbox":"read-only","ephemeral":true}}
+{"jsonrpc":"2.0","id":5,"method":"turn/start","params":{"threadId":"01a1d8a6-effe-7ff3-82ca-e331814b25be","input":[{"type":"text","text":"请使用命令行工具列出当前工作区根目录的文件（例如运行 `ls -la`），然后用一句话总结你看到了哪些文件。","text_elements":[]}]}}
+{"jsonrpc":"2.0","id":0,"result":{"decision":"accept"}}
