@@ -131,14 +131,16 @@ describe('@nuh/mcp-bridge IPC server and reconnect client', () => {
     }
   });
 
-  it('creates launch spec targeting the compiled dist/bin.js', () => {
+  it('creates launch spec with an explicit binPath without requiring prebuilt dist', () => {
+    const stubBinPath = path.join(os.tmpdir(), 'nuh-mcp-bridge-stub-bin.js');
     const spec = createMcpBridgeLaunchSpec({
       socketPath: '/tmp/test.sock',
       cwd: '/tmp/work',
+      binPath: stubBinPath,
     });
     assert.equal(spec.serverName, MCP_BRIDGE_DEFAULT_SERVER_NAME);
     assert.equal(spec.command, process.execPath);
-    assert.ok(spec.args[0]?.endsWith(path.join('dist', 'bin.js')));
+    assert.deepEqual(spec.args, [stubBinPath]);
     assert.deepEqual(spec.env, {
       NUH_MCP_SOCKET: '/tmp/test.sock',
       NUH_MCP_CWD: '/tmp/work',

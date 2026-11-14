@@ -8,6 +8,8 @@ import { Writable } from 'node:stream';
 import { afterEach, describe, it } from 'node:test';
 import { fileURLToPath } from 'node:url';
 import {
+  createMcpBridgeLaunchSpec,
+  MCP_BRIDGE_DEFAULT_SERVER_NAME,
   McpBridgeIpcServer,
   type McpBridgeToolProvider,
   type McpBridgeToolSpec,
@@ -289,6 +291,23 @@ afterEach(() => {
 });
 
 describe('MCP Bridge & dsh-mnemon integration', () => {
+  it('resolves compiled dist/bin.js when creating default launch spec', () => {
+    const spec = createMcpBridgeLaunchSpec({
+      socketPath: '/tmp/test.sock',
+      cwd: '/tmp/work',
+    });
+    const binArg = spec.args[0];
+    assert.ok(binArg);
+    assert.equal(spec.serverName, MCP_BRIDGE_DEFAULT_SERVER_NAME);
+    assert.equal(spec.command, process.execPath);
+    assert.ok(binArg.endsWith(path.join('dist', 'bin.js')));
+    assert.equal(existsSync(binArg), true);
+    assert.deepEqual(spec.env, {
+      NUH_MCP_SOCKET: '/tmp/test.sock',
+      NUH_MCP_CWD: '/tmp/work',
+    });
+  });
+
   it('supports concurrent stdio proxies, reconnection after IPC restart, read-only enforcement, and socket cleanup', async () => {
     const tempDir = mkdtempSync(path.join(tmpdir(), 'nuh-int-mcp-'));
     cleanupPaths.push(tempDir);
