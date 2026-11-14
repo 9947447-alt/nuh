@@ -1,0 +1,125 @@
+{
+  "$schema": "./node_modules/@biomejs/biome/configuration_schema.json",
+  "vcs": {
+    "enabled": true,
+    "clientKind": "git",
+    "useIgnoreFile": true
+  },
+  "files": {
+    "includes": [
+      "**",
+      "!**/dist",
+      "!**/node_modules",
+      "!tests/fixtures",
+      "!pnpm-lock.yaml",
+      "!**/*.md"
+    ]
+  },
+  "formatter": {
+    "enabled": true,
+    "indentStyle": "space",
+    "indentWidth": 2,
+    "lineWidth": 100
+  },
+  "javascript": {
+    "formatter": {
+      "quoteStyle": "single",
+      "trailingCommas": "all",
+      "semicolons": "always"
+    }
+  },
+  "json": {
+    "formatter": {
+      "indentStyle": "space",
+      "indentWidth": 2
+    }
+  },
+  "linter": {
+    "enabled": true,
+    "rules": {
+      "preset": "recommended",
+      "correctness": {
+        "noUnusedImports": "error",
+        "noUnusedVariables": "error"
+      },
+      "style": {
+        "noNonNullAssertion": "error",
+        "useImportType": "error",
+        "useNodejsImportProtocol": "error"
+      },
+      "suspicious": {
+        "noEmptyBlockStatements": "error",
+        "noExplicitAny": "error"
+      }
+    }
+  },
+  "overrides": [
+    {
+      "includes": ["apps/**/*.ts", "apps/**/*.mts", "apps/**/*.js", "apps/**/*.mjs"],
+      "linter": {
+        "rules": {
+          "style": {
+            "noRestrictedImports": {
+              "level": "error",
+              "options": {
+                "paths": {
+                  "@nuh/core": "apps/* 禁止越界直连 @nuh/core，必须通过 @nuh/protocol JSON-RPC 通信",
+                  "@nuh/backends": "apps/* 禁止越界直连 @nuh/backends，必须通过 @nuh/protocol JSON-RPC 通信",
+                  "@nuh/dsh-shims": "apps/* 禁止越界直连 @nuh/dsh-shims",
+                  "@nuh/mcp-bridge": "apps/* 禁止越界直连 @nuh/mcp-bridge",
+                  "ink": "Phase 3 验收完成前禁止在前端层引入 TUI 框架 (ink)",
+                  "blessed": "Phase 3 验收完成前禁止在前端层引入 TUI 框架 (blessed)",
+                  "react": "Phase 3 验收完成前禁止引入 Web/TUI 前端框架 (react)",
+                  "vite": "Phase 3 验收完成前禁止引入 Web 前端框架 (vite)",
+                  "electron": "Phase 3 验收完成前禁止引入 Desktop 壳 (electron)"
+                },
+                "patterns": [
+                  {
+                    "group": ["@deepseek-ai/*", "@deepseek-ai/**"],
+                    "message": "apps/* 禁止直接引用 @deepseek-ai/* 底层包"
+                  },
+                  {
+                    "group": ["../../packages/**", "../**/packages/**"],
+                    "message": "apps/* 禁止通过相对路径越界引用 packages/*"
+                  }
+                ]
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "includes": [
+        "packages/protocol/**/*.ts",
+        "packages/protocol/**/*.mts",
+        "packages/protocol/**/*.js",
+        "packages/protocol/**/*.mjs"
+      ],
+      "linter": {
+        "rules": {
+          "style": {
+            "noRestrictedImports": {
+              "level": "error",
+              "options": {
+                "paths": {
+                  "@nuh/core": "@nuh/protocol 是最底层契约包，禁止反向依赖 @nuh/core",
+                  "@nuh/backends": "@nuh/protocol 禁止反向依赖 @nuh/backends",
+                  "@nuh/dsh-shims": "@nuh/protocol 禁止反向依赖 @nuh/dsh-shims",
+                  "@nuh/mcp-bridge": "@nuh/protocol 禁止反向依赖 @nuh/mcp-bridge",
+                  "@nuh/cli-repl": "@nuh/protocol 禁止反向依赖 @nuh/cli-repl"
+                },
+                "patterns": [
+                  {
+                    "group": ["@deepseek-ai/*", "@deepseek-ai/**"],
+                    "message": "@nuh/protocol 是纯协议契约层，禁止依赖 @deepseek-ai/*"
+                  }
+                ]
+              }
+            }
+          }
+        }
+      }
+    }
+  ]
+}
